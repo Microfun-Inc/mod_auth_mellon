@@ -40,6 +40,11 @@ static const char *am_cookie_name(request_rec *r)
 
     dir_cfg = am_get_dir_cfg(r);
 
+    if (dir_cfg->varname[0] == '=')
+    {
+        return dir_cfg->varname + 1;
+    }
+
     return apr_pstrcat(r->pool, "mellon-", dir_cfg->varname, NULL);
 }
 

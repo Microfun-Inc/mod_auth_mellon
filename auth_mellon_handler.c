@@ -1288,7 +1288,7 @@ static apr_time_t am_parse_timestamp(request_rec *r, const char *timestamp)
  *  OK on success, HTTP_BAD_REQUEST on failure.
  */
 static int am_validate_subject(request_rec *r, LassoSaml2Assertion *assertion,
-                               const char *url)
+                               const char *url, const char *return_to)
 {
     apr_time_t now;
     apr_time_t t;
@@ -1378,6 +1378,61 @@ static int am_validate_subject(request_rec *r, LassoSaml2Assertion *assertion,
                           "Current address is \"%s\", but should have been \"%s\".",
                           am_compat_request_ip(r), scd->Address);
             return HTTP_BAD_REQUEST;
+        }
+    }
+
+
+    if (cfg->session_length > 0) {
+        GList *authn_itr;
+        LassoSaml2AuthnStatement *authn;
+
+        for(authn_itr = g_list_first(assertion->AuthnStatement); authn_itr != NULL;
+            authn_itr = g_list_next(authn_itr)) {
+
+            authn = authn_itr->data;
+            if (!LASSO_IS_SAML2_AUTHN_STATEMENT(authn)) {
+                AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                              "Wrong type of AuthnStatement node.");
+                continue;
+            }
+
+            /* Find timestamp. */
+            if (authn->AuthnInstant == NULL) {
+                am_diag_printf(r, "%s failed to find"
+                               " Assertion.AuthnStatement.AuthnInstant\n",
+                               __func__);
+                continue;
+            }
+
+
+            /* Parse timestamp. */
+            t = am_parse_timestamp(r, authn->AuthnInstant);
+            if (t == 0) {
+                AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                              "Invalid timestamp in AuthnInstant in AuthnStatement.");
+                continue;
+            }
+
+            am_diag_printf(r, "%s Assertion.AuthnStatement.AuthnInstant:"
+                           " %s\n",
+                           __func__, am_diag_time_t_to_8601(r, t));
+
+            /* Verify it has not been too long since the user typed his/her password */
+            if (now >= t + apr_time_make(cfg->session_length, 0)) {
+                AM_LOG_RERROR(APLOG_MARK, APLOG_ERR, 0, r,
+                              "AuthnInstant in AuthnStatement was too early regarding configured session length.");
+
+                const char *endpoint = am_get_endpoint_url(r);
+                const char * idp = am_get_idp(r);
+                const char * login_url = apr_psprintf(r->pool, "%slogin?ForceAuthn=true&ReturnTo=%s&IdP=%s",
+                                 endpoint,
+                                 return_to,
+                                 am_urlencode(r->pool, idp));
+
+                apr_table_setn(r->headers_out, "Location", login_url);
+
+                return HTTP_SEE_OTHER;
+            }
         }
     }
 
@@ -1822,7 +1877,7 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
         return HTTP_BAD_REQUEST;
     }
 
-    rc = am_validate_subject(r, assertion, url);
+    rc = am_validate_subject(r, assertion, url, relay_state);
     if (rc != OK) {
         lasso_login_destroy(login);
         return rc;
@@ -1920,10 +1975,10 @@ static int am_handle_reply_common(request_rec *r, LassoLogin *login,
 
     /* Mark user as logged in. */
     session->logged_in = 1;
+    am_cache_env_populate(r, session);
 
     am_release_request_session(r, session);
     lasso_login_destroy(login);
-
 
     /* No RelayState - we don't know what to do. Use default login path. */
     if(relay_state == NULL || strlen(relay_state) == 0) {
@@ -2799,7 +2854,8 @@ static int am_init_authn_request_common(request_rec *r,
                                         const char *destination_url,
                                         const char *assertion_consumer_service_url,
                                         const char *return_to_url,
-                                        int is_passive)
+                                        int is_passive,
+                                        int force_authn)
 {
     gint ret;
     am_dir_cfg_rec *dir_cfg;
@@ -2862,7 +2918,7 @@ static int am_init_authn_request_common(request_rec *r,
          * So leave that empty for now, it is not strictly required */
     }
 
-    request->ForceAuthn = FALSE;
+    request->ForceAuthn = force_authn;
     request->IsPassive = is_passive;
     request->NameIDPolicy->AllowCreate = TRUE;
 
@@ -3062,7 +3118,7 @@ static int am_send_paos_authn_request(request_rec *r)
     ret = am_init_authn_request_common(r, &login,
                                        NULL, LASSO_HTTP_METHOD_PAOS, NULL,
                                        assertion_consumer_service_url,
-                                       relay_state, is_passive);
+                                       relay_state, is_passive, FALSE);
     g_free(assertion_consumer_service_url);
 
     if (ret != OK) {
@@ -3099,7 +3155,7 @@ static int am_send_paos_authn_request(request_rec *r)
  */
 static int am_send_login_authn_request(request_rec *r, const char *idp,
                                  const char *return_to_url,
-                                 int is_passive)
+                                 int is_passive, int force_authn)
 {
     int ret;
     LassoServer *server;
@@ -3156,7 +3212,7 @@ static int am_send_login_authn_request(request_rec *r, const char *idp,
     ret = am_init_authn_request_common(r, &login, idp, http_method,
                                        destination_url,
                                        assertion_consumer_service_url,
-                                       return_to_url, is_passive);
+                                       return_to_url, is_passive, force_authn);
 
     g_free(destination_url);
     g_free(assertion_consumer_service_url);
@@ -3211,7 +3267,7 @@ static int am_handle_auth(request_rec *r)
             relay_state = return_url;
     }
 
-    return am_send_login_authn_request(r, am_get_idp(r), relay_state, FALSE);
+    return am_send_login_authn_request(r, am_get_idp(r), relay_state, FALSE, FALSE);
 }
 
 /* This function handles requests to the login handler.
@@ -3229,6 +3285,7 @@ static int am_handle_login(request_rec *r)
     const char *idp;
     char *return_to;
     int is_passive;
+    int force_authn;
     int ret;
 
     am_diag_printf(r, "enter function %s\n", __func__);
@@ -3269,6 +3326,11 @@ static int am_handle_login(request_rec *r)
         return ret;
     }
 
+    ret = am_get_boolean_query_parameter(r, "ForceAuthn", &force_authn, FALSE);
+    if (ret != OK) {
+        return ret;
+    }
+
     if(idp_param != NULL) {
         idp = idp_param;
     } else if(cfg->discovery_url) {
@@ -3284,7 +3346,7 @@ static int am_handle_login(request_rec *r)
         idp = am_get_idp(r);
     }
 
-    return am_send_login_authn_request(r, idp, return_to, is_passive);
+    return am_send_login_authn_request(r, idp, return_to, is_passive, force_authn);
 }
 
 /* This function probes an URL (HTTP GET)
